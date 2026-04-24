@@ -1,30 +1,27 @@
 import os
-import time
 import logging
 import asyncio
-from typing import Dict, Any, List, Optional, Set, Tuple
+from typing import Dict, Any, List, Optional, Set
 
 import requests
 import discord
 from discord.ext import commands, tasks
 
 # =========================
-# MLB STEALS ALERT BOT
+# MLB STEALS ALERT BOT - V2
 # =========================
-# Environment variables needed:
+# Fixes:
+# - Prevents reposting old steals on startup/redeploy
+# - Stronger dedupe key
+# - Only alerts newly discovered steal events after bot is ready
+#
+# Environment variables:
 # DISCORD_TOKEN=your_discord_bot_token
 # DISCORD_CHANNEL_ID=your_channel_id
-#
-# Optional:
 # POLL_SECONDS=15
 # ALERT_CAUGHT_STEALING=false
 # ALERT_PICKOFF_CAUGHT_STEALING=false
-#
-# Install:
-# pip install discord.py requests
-#
-# Run:
-# python mlb_steals_alert_bot.py
+# ALERT_OLD_EVENTS_ON_STARTUP=false
 
 
 logging.basicConfig(
@@ -40,16 +37,18 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "15"))
 
 ALERT_CAUGHT_STEALING = os.getenv("ALERT_CAUGHT_STEALING", "false").lower() == "true"
 ALERT_PICKOFF_CAUGHT_STEALING = os.getenv("ALERT_PICKOFF_CAUGHT_STEALING", "false").lower() == "true"
+ALERT_OLD_EVENTS_ON_STARTUP = os.getenv("ALERT_OLD_EVENTS_ON_STARTUP", "false").lower() == "true"
 
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
 MLB_LIVE_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
 
 intents = discord.Intents.default()
+intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Keeps us from posting the same steal twice.
-# Stored as: gamePk-playEndTime-eventType-runnerId-base
 seen_steal_events: Set[str] = set()
+startup_seed_complete = False
 
 
 def mlb_logo(team_id: Optional[int]) -> Optional[str]:
@@ -59,13 +58,12 @@ def mlb_logo(team_id: Optional[int]) -> Optional[str]:
 
 
 def get_today_game_pks() -> List[int]:
-    params = {
-        "sportId": 1,
-        "hydrate": "team",
-    }
-
     try:
-        r = requests.get(MLB_SCHEDULE_URL, params=params, timeout=15)
+        r = requests.get(
+            MLB_SCHEDULE_URL,
+            params={"sportId": 1, "hydrate": "team"},
+            timeout=15
+        )
         r.raise_for_status()
         data = r.json()
     except Exception as e:
@@ -76,15 +74,13 @@ def get_today_game_pks() -> List[int]:
 
     for date_block in data.get("dates", []):
         for game in date_block.get("games", []):
-            status = game.get("status", {}).get("detailedState", "")
             game_pk = game.get("gamePk")
+            status = game.get("status", {}).get("detailedState", "").lower()
 
-            # Keep live/final-ish games because a steal can appear as the game is changing states.
-            # Skip clearly postponed/cancelled games.
             if not game_pk:
                 continue
 
-            if status.lower() in {
+            if status in {
                 "postponed",
                 "cancelled",
                 "canceled",
@@ -118,7 +114,10 @@ def team_name(game_data: Dict[str, Any], side: str) -> str:
     )
 
 
-def team_id(game_data: Dict[str, Any], side: str) -> Optional[int]:
+def team_id(game_data: Dict[str, Any], side: Optional[str]) -> Optional[int]:
+    if not side:
+        return None
+
     return (
         game_data
         .get("gameData", {})
@@ -176,23 +175,20 @@ def player_headshot(player_id: Optional[int]) -> Optional[str]:
 
 
 def offense_side_for_play(play: Dict[str, Any]) -> Optional[str]:
-    # MLB feed usually includes matchup.batSide but not team side.
-    # The batting team is generally inferable from about.halfInning:
-    # Top = away batting, Bottom = home batting.
     half = play.get("about", {}).get("halfInning", "").lower()
+
     if half == "top":
         return "away"
+
     if half == "bottom":
         return "home"
+
     return None
 
 
 def steal_base_label(event: str, movement: Dict[str, Any]) -> str:
     event_l = event.lower()
-
-    # Movement fields are often clearer than the event string.
     end = movement.get("end")
-    start = movement.get("start")
 
     if end:
         base_map = {
@@ -201,7 +197,7 @@ def steal_base_label(event: str, movement: Dict[str, Any]) -> str:
             "3B": "home",
             "score": "home",
         }
-        return base_map.get(end, str(end))
+        return base_map.get(str(end), str(end))
 
     if "2nd" in event_l or "second" in event_l:
         return "second base"
@@ -210,16 +206,40 @@ def steal_base_label(event: str, movement: Dict[str, Any]) -> str:
     if "home" in event_l:
         return "home"
 
-    if start:
-        return f"from {start}"
-
     return "a base"
 
 
 def runner_id_from_runner(runner: Dict[str, Any]) -> Optional[int]:
+    return runner.get("details", {}).get("runner", {}).get("id")
+
+
+def make_steal_key(game_pk: int, play: Dict[str, Any], runner: Dict[str, Any]) -> str:
+    about = play.get("about", {})
     details = runner.get("details", {})
-    runner_obj = details.get("runner", {})
-    return runner_obj.get("id")
+    movement = runner.get("movement", {})
+
+    at_bat_index = about.get("atBatIndex", "")
+    play_id = about.get("playId", "") or about.get("playGuid", "")
+    runner_id = runner_id_from_runner(runner) or ""
+    event_type = details.get("eventType", "")
+    event = details.get("event", "")
+    start_base = movement.get("start", "")
+    end_base = movement.get("end", "")
+    is_out = movement.get("isOut", "")
+
+    return "|".join(
+        str(x) for x in [
+            game_pk,
+            at_bat_index,
+            play_id,
+            runner_id,
+            event_type,
+            event,
+            start_base,
+            end_base,
+            is_out,
+        ]
+    )
 
 
 def find_steal_events(game_data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -231,20 +251,15 @@ def find_steal_events(game_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     )
 
     events: List[Dict[str, Any]] = []
-    game_pk = game_data.get("gamePk")
+    game_pk = int(game_data.get("gamePk"))
 
     for play in plays:
-        play_end_time = play.get("about", {}).get("endTime") or play.get("about", {}).get("startTime") or ""
-        play_index = play.get("about", {}).get("atBatIndex", "x")
-        runners = play.get("runners", [])
-
-        for idx, runner in enumerate(runners):
+        for runner in play.get("runners", []):
             details = runner.get("details", {})
             movement = runner.get("movement", {})
 
             event = details.get("event", "") or ""
             event_type = details.get("eventType", "") or ""
-            is_out = bool(movement.get("isOut"))
 
             event_l = event.lower()
             event_type_l = event_type.lower()
@@ -278,26 +293,18 @@ def find_steal_events(game_data: Dict[str, Any]) -> List[Dict[str, Any]]:
             if not should_alert:
                 continue
 
-            runner_id = runner_id_from_runner(runner)
-            base = steal_base_label(event, movement)
-
-            dedupe_key = f"{game_pk}-{play_end_time}-{play_index}-{idx}-{event_type}-{runner_id}-{base}-{is_out}"
-
-            if dedupe_key in seen_steal_events:
-                continue
-
-            seen_steal_events.add(dedupe_key)
+            key = make_steal_key(game_pk, play, runner)
 
             events.append({
                 "gamePk": game_pk,
+                "key": key,
                 "play": play,
                 "runner": runner,
-                "runnerId": runner_id,
+                "runnerId": runner_id_from_runner(runner),
                 "event": event or event_type or "Stolen Base",
                 "eventType": event_type,
-                "base": base,
-                "isOut": is_out,
-                "dedupeKey": dedupe_key,
+                "base": steal_base_label(event, movement),
+                "isOut": bool(movement.get("isOut")),
             })
 
     return events
@@ -313,30 +320,30 @@ async def send_steal_alert(channel: discord.TextChannel, game_data: Dict[str, An
     is_out = steal.get("isOut", False)
 
     offense_side = offense_side_for_play(play)
-    logo_url = mlb_logo(team_id(game_data, offense_side)) if offense_side else None
+    logo_url = mlb_logo(team_id(game_data, offense_side))
 
     score = game_score_line(game_data)
     inning = inning_text(play, game_data)
 
-    description = f"**{runner_name}** stole **{base}**."
-
     title = "🚨 MLB Stolen Base Alert"
+    description = f"**{runner_name}** stole **{base}**."
+    color = 0x2ecc71
 
     if is_out or "caught stealing" in event.lower():
         title = "🚨 MLB Caught Stealing Alert"
         description = f"**{runner_name}** was caught stealing **{base}**."
+        color = 0xe67e22
 
     embed = discord.Embed(
         title=title,
         description=description,
-        color=0x2ecc71 if not is_out else 0xe67e22
+        color=color
     )
 
     embed.add_field(name="Game", value=score, inline=False)
     embed.add_field(name="Inning", value=inning, inline=True)
     embed.add_field(name="Event", value=event, inline=True)
 
-    # Link to MLB game page
     game_pk = steal.get("gamePk")
     if game_pk:
         embed.add_field(
@@ -357,11 +364,36 @@ async def send_steal_alert(channel: discord.TextChannel, game_data: Dict[str, An
     await channel.send(embed=embed)
 
 
+def collect_current_steal_keys() -> int:
+    count = 0
+
+    for game_pk in get_today_game_pks():
+        game_data = get_live_game(game_pk)
+        if not game_data:
+            continue
+
+        for steal in find_steal_events(game_data):
+            seen_steal_events.add(steal["key"])
+            count += 1
+
+    return count
+
+
 @tasks.loop(seconds=POLL_SECONDS)
 async def poll_mlb_steals():
+    global startup_seed_complete
+
     if not DISCORD_CHANNEL_ID:
         log.error("Missing DISCORD_CHANNEL_ID")
         return
+
+    if not startup_seed_complete and not ALERT_OLD_EVENTS_ON_STARTUP:
+        seeded = collect_current_steal_keys()
+        startup_seed_complete = True
+        log.info("Startup seed complete. Marked %s existing steal events as already seen.", seeded)
+        return
+
+    startup_seed_complete = True
 
     channel = bot.get_channel(DISCORD_CHANNEL_ID)
     if channel is None:
@@ -377,7 +409,7 @@ async def poll_mlb_steals():
         log.info("No MLB games found today.")
         return
 
-    log.info("Checking %s MLB games for steal events...", len(game_pks))
+    new_alerts = 0
 
     for game_pk in game_pks:
         game_data = get_live_game(game_pk)
@@ -387,11 +419,21 @@ async def poll_mlb_steals():
         steals = find_steal_events(game_data)
 
         for steal in steals:
+            key = steal["key"]
+
+            if key in seen_steal_events:
+                continue
+
+            seen_steal_events.add(key)
+            new_alerts += 1
+
             try:
                 await send_steal_alert(channel, game_data, steal)
                 await asyncio.sleep(0.5)
             except Exception as e:
                 log.exception("Failed sending steal alert: %s", e)
+
+    log.info("Poll complete. New steal alerts posted: %s", new_alerts)
 
 
 @poll_mlb_steals.before_loop
